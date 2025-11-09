@@ -435,6 +435,11 @@ def get_top25_bid_volume_symbols() -> List[Tuple[str, float]]:
     candidates.sort(key=lambda x: x[1], reverse=True)
     return candidates[:TOP_N]
 
+def get_symbol_price(symbol: str) -> Decimal:
+    """Safely get current price from live_prices"""
+    with price_lock:
+        return live_prices.get(symbol, ZERO)
+
 def rebalance_portfolio(bot: RebalancerBot):
     logger.info("Starting portfolio rebalance...")
 
@@ -464,28 +469,52 @@ def rebalance_portfolio(bot: RebalancerBot):
     usdt_free = bot.get_balance()
     target_per_coin = (usdt_free - MIN_BUFFER_USDT) / max(len(top25), 1)
 
-    # 3. SELL: Anything NOT in Top 25 (except stablecoins unless needed)
+    # ------------------------------------------------------------------- #
+    # === SELL: Anything NOT in Top 25 (with $5 protection) === #
+    # ------------------------------------------------------------------- #
     for sym, info in list(positions.items()):
         if sym in top25_symbols:
-            continue  # Keep
+            continue  # Keep in portfolio
 
-        # Sell non-stablecoins
-        if not info['is_stable']:
-            value = info['qty'] * live_prices.get(sym, ZERO)
-            if value >= MIN_TRADE_VALUE_USDT:
-                bot.place_market_sell(sym, float(info['qty']))
+        price = get_symbol_price(sym)
+        if price <= ZERO:
+            logger.warning(f"No price for {sym} → skip sell")
             continue
 
-        # Sell stablecoins only if we need USDT to buy
-        if info['is_stable'] and usdt_free < MIN_BUFFER_USDT + target_per_coin:
-            sell_qty = min(info['qty'], (MIN_BUFFER_USDT + target_per_coin - usdt_free))
-            if sell_qty > ZERO:
-                bot.place_market_sell(sym, float(sell_qty))
+        position_value = info['qty'] * price
 
-    # 4. BUY: Top 25 (only if enough USDT)
+        # === $5 POSITION MINIMUM: Do NOT sell if total < $5 ===
+        if position_value < MIN_TRADE_VALUE_USDT:
+            logger.info(f"DUST: {sym} = ${position_value:.2f} < $5.00 → SKIP")
+            continue
+
+        # === Determine quantity to sell ===
+        if not info['is_stable']:
+            # Sell full non-stablecoin position
+            qty_to_sell = info['qty']
+        else:
+            # Sell stablecoin only if needed for USDT
+            needed = MIN_BUFFER_USDT + target_per_coin - usdt_free
+            if needed <= ZERO:
+                continue
+            qty_to_sell = min(info['qty'], needed / price)
+
+        # === $5 ORDER MINIMUM: Do NOT place order < $5 ===
+        order_value = qty_to_sell * price
+        if order_value < MIN_TRADE_VALUE_USDT:
+            logger.info(f"ORDER TOO SMALL: {qty_to_sell:.6f} {info['asset']} = ${order_value:.2f} < $5.00 → BLOCKED")
+            continue
+
+        # === SAFE TO SELL ===
+        logger.info(f"SELLING: {qty_to_sell:.6f} {info['asset']} ({sym}) = ${order_value:.2f}")
+        bot.place_market_sell(sym, float(qty_to_sell))
+
+    # ------------------------------------------------------------------- #
+    # === BUY: Top 25 (unchanged — already has MIN_TRADE_VALUE_USDT) === #
+    # ------------------------------------------------------------------- #
     for sym, bid_vol in top25:
         if sym in positions:
-            continue  # Already own
+            continue
 
         if target_per_coin < MIN_TRADE_VALUE_USDT:
             continue
