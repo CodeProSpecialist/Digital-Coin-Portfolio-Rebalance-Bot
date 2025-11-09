@@ -1,4 +1,4 @@
-# Digital-Coin-Portfolio-Rebalancer
+# Digital-Coin-Portfolio-Rebalancer for Binance.US
 Digital Coin Portfolio Rebalancer
 
 Sells/converts any position NOT in the Top 25 bid volume (USDT value)
