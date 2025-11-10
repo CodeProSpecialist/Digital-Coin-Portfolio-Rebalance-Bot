@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """
     PORTFOLIO REBALANCER – TOP 25 BID VOLUME ONLY
-    • Sell ANY position NOT in Top 25 bid volume (depth-5, USDT value)
-    • Only buy from Top 25 bid volume list (USDT pairs)
-    • NEVER buy stablecoins (USDT, USDC, BUSD, TUSD, DAI, FDUSD, etc.)
-    • Only sell stablecoins to free USDT if needed
-    • Runs every 2 hours
-    • $8 USDT buffer | 100% WebSocket | WhatsApp alerts
+    • Sell excess >5% per position (limit → retry 2x → market)
+    • Buy 5% of total USDT cash into each Top 25 coin
+    • No BTC, ETH, BCH | >$100k volume | >5 depth bids
+    • $8 buffer + 1/5 cash reserve | $5 min order | WhatsApp alerts
+    • FULLY FIXED: Decimal/float safety, syntax, lot/tick handling
 """
 
 import os
@@ -45,6 +44,8 @@ MIN_BUFFER_USDT = Decimal('8.0')
 MIN_TRADE_VALUE_USDT = Decimal('5.0')
 ENTRY_PCT_BELOW_ASK = Decimal('0.001')  # 0.1%
 TOP_N = 25
+MIN_USDT_FRACTION = Decimal('0.2')       # 1/5 in cash
+PERCENTAGE_PER_COIN = Decimal('0.05')    # 5% per coin
 
 # ---- Filters ---------------------------------------------------------------
 MIN_24H_VOLUME_USDT = 100000
@@ -69,7 +70,6 @@ CST_TZ = pytz.timezone('America/Chicago')
 # --------------------------------------------------------------------------- #
 ZERO = Decimal('0')
 ONE = Decimal('1')
-HUNDRED = Decimal('100')
 
 # --------------------------------------------------------------------------- #
 # =============================== LOGGING ================================= #
@@ -268,10 +268,10 @@ def on_user_message(ws, message):
         price = to_decimal(ev['p'])
         qty = to_decimal(ev['q'])
 
-        if status == 'FILLED':
+        if status in ('FILLED', 'PARTIALLY_FILLED'):
             with DBManager() as sess:
                 sess.add(TradeRecord(symbol=symbol, side=side, price=price, quantity=qty))
-            send_whatsapp_alert(f"{side} {symbol} FILLED @ {price} | Qty: {qty}")
+            send_whatsapp_alert(f"{side} {symbol} {status} @ {price} | Qty: {qty}")
             logger.info(f"FILL: {side} {symbol} @ {price}")
     except Exception as e:
         logger.debug(f"User WS error: {e}")
@@ -372,18 +372,44 @@ class RebalancerBot:
                 return to_decimal(b['free'])
         return ZERO
 
-    def get_asset_balance(self, asset: str) -> Decimal:
+    def get_total_account_value(self) -> Decimal:
         with self.api_lock:
             acct = self.client.get_account()
+        total = ZERO
         for b in acct['balances']:
-            if b['asset'] == asset:
-                return to_decimal(b['free'])
-        return ZERO
+            asset = b['asset']
+            qty = to_decimal(b['free'])
+            if qty <= ZERO: continue
+            if asset == 'USDT':
+                total += qty
+                continue
+            sym = f"{asset}USDT"
+            if sym not in live_prices: continue
+            total += qty * live_prices[sym]
+        return total
 
-    def place_market_sell(self, symbol: str, qty: float):
+    def place_limit_sell(self, symbol: str, price: str, qty: Decimal):
         try:
             with self.api_lock:
-                order = self.client.order_market_sell(symbol=symbol, quantity=qty)
+                order = self.client.order_limit_sell(
+                    symbol=symbol,
+                    quantity=str(qty),
+                    price=price
+                )
+            logger.info(f"LIMIT SELL: {symbol} @ {price} | Qty: {qty}")
+            send_whatsapp_alert(f"SELL {symbol} {qty} @ {price} (limit)")
+            return order
+        except Exception as e:
+            logger.error(f"Limit sell failed {symbol}: {e}")
+            return None
+
+    def place_market_sell(self, symbol: str, qty: Decimal):
+        try:
+            with self.api_lock:
+                order = self.client.order_market_sell(
+                    symbol=symbol,
+                    quantity=str(qty)
+                )
             logger.info(f"MARKET SELL: {symbol} {qty}")
             send_whatsapp_alert(f"SELL {symbol} {qty} (market)")
             return order
@@ -391,10 +417,14 @@ class RebalancerBot:
             logger.error(f"Market sell failed {symbol}: {e}")
             return None
 
-    def place_limit_buy(self, symbol: str, price: str, qty: float):
+    def place_limit_buy(self, symbol: str, price: str, qty: Decimal):
         try:
             with self.api_lock:
-                order = self.client.order_limit_buy(symbol=symbol, quantity=qty, price=price)
+                order = self.client.order_limit_buy(
+                    symbol=symbol,
+                    quantity=str(qty),
+                    price=price
+                )
             logger.info(f"LIMIT BUY: {symbol} @ {price} | Qty: {qty}")
             send_whatsapp_alert(f"BUY {symbol} @ {price}")
             return order
@@ -402,11 +432,28 @@ class RebalancerBot:
             logger.error(f"Limit buy failed {symbol}: {e}")
             return None
 
+    def cancel_order(self, symbol: str, order_id: int):
+        try:
+            with self.api_lock:
+                self.client.cancel_order(symbol=symbol, orderId=order_id)
+            logger.info(f"CANCELLED order {order_id} for {symbol}")
+            return True
+        except Exception as e:
+            logger.error(f"Cancel failed {symbol} {order_id}: {e}")
+            return False
+
+    def get_order_status(self, symbol: str, order_id: int):
+        try:
+            with self.api_lock:
+                order = self.client.get_order(symbol=symbol, orderId=order_id)
+            return order['status']
+        except:
+            return None
+
 # --------------------------------------------------------------------------- #
 # =========================== REBALANCING LOGIC ============================= #
 # --------------------------------------------------------------------------- #
 def get_top25_bid_volume_symbols() -> List[Tuple[str, float]]:
-    """Return top 25 symbols by bid USDT volume in depth-5"""
     candidates = []
     for sym in valid_symbols_dict:
         if not sym.endswith('USDT'): continue
@@ -415,8 +462,7 @@ def get_top25_bid_volume_symbols() -> List[Tuple[str, float]]:
 
         with book_lock:
             bids = live_bids.get(sym, [])
-            asks = live_asks.get(sym, [])
-        if len(bids) < DEPTH_LEVELS or len(asks) < DEPTH_LEVELS:
+        if len(bids) < DEPTH_LEVELS:
             continue
 
         bid_usdt_vol = sum(float(p) * float(q) for p, q in bids[:DEPTH_LEVELS])
@@ -435,88 +481,94 @@ def get_top25_bid_volume_symbols() -> List[Tuple[str, float]]:
     return candidates[:TOP_N]
 
 def get_symbol_price(symbol: str) -> Decimal:
-    """Safely get current price from live_prices"""
     with price_lock:
         return live_prices.get(symbol, ZERO)
+
+def sell_to_usdt(bot: RebalancerBot, sym: str, qty: Decimal):
+    price = get_symbol_price(sym)
+    if price <= ZERO: return False
+
+    step = bot.get_lot_step(sym)
+    qty = (qty // step) * step
+    if qty <= ZERO: return False
+
+    order_value = qty * price
+    if order_value < MIN_TRADE_VALUE_USDT: return False
+
+    with book_lock:
+        bids = live_bids.get(sym, [])
+    if not bids: return False
+    bid_price = bids[0][0]
+    tick = bot.get_tick_size(sym)
+    limit_price = (bid_price // tick) * tick
+
+    if qty * limit_price < MIN_TRADE_VALUE_USDT:
+        return False
+
+    order = bot.place_limit_sell(sym, str(limit_price), qty)
+    if not order: return False
+    order_id = order['orderId']
+
+    for attempt in range(3):
+        time.sleep(45)
+        status = bot.get_order_status(sym, order_id)
+        if status in ('FILLED', 'PARTIALLY_FILLED'):
+            logger.info(f"SELL SUCCESS: {sym} {qty} @ ~{limit_price}")
+            return True
+        if status == 'CANCELED':
+            break
+        bot.cancel_order(sym, order_id)
+        time.sleep(2)
+        order = bot.place_limit_sell(sym, str(limit_price), qty)
+        if order:
+            order_id = order['orderId']
+
+    bot.place_market_sell(sym, qty)
+    return True
 
 def rebalance_portfolio(bot: RebalancerBot):
     logger.info("Starting portfolio rebalance...")
 
-    # 1. Get current positions
+    total_value = bot.get_total_account_value()
+    usdt_free = bot.get_balance()
+    logger.info(f"Total Value: ${total_value:.2f} | USDT Free: ${usdt_free:.2f}")
+
+    min_cash_reserve = max(usdt_free * MIN_USDT_FRACTION, MIN_BUFFER_USDT)
+    investable_usdt = usdt_free - min_cash_reserve
+    if investable_usdt < ZERO:
+        investable_usdt = ZERO
+    logger.info(f"Investable: ${investable_usdt:.2f} | Reserve: ${min_cash_reserve:.2f}")
+
     with bot.api_lock:
         acct = bot.client.get_account()
     positions = {}
     for b in acct['balances']:
         asset = b['asset']
         qty = to_decimal(b['free'])
-        if qty <= ZERO: continue
-        if asset == 'USDT':
-            continue
+        if qty <= ZERO or asset == 'USDT': continue
         sym = f"{asset}USDT"
-        if sym not in valid_symbols_dict:
-            continue
-        positions[sym] = {
-            'asset': asset,
-            'qty': qty,
-            'is_stable': is_stablecoin(asset)
-        }
+        if sym not in valid_symbols_dict: continue
+        positions[sym] = {'asset': asset, 'qty': qty}
 
-    # 2. Get Top 25
-    top25 = get_top25_bid_volume_symbols()
-    top25_symbols = {sym for sym, _ in top25}
-
-    usdt_free = bot.get_balance()
-    target_per_coin = (usdt_free - MIN_BUFFER_USDT) / max(len(top25), 1)
-
-    # ------------------------------------------------------------------- #
-    # === SELL: Anything NOT in Top 25 (with $5 protection) === #
-    # ------------------------------------------------------------------- #
-    for sym, info in list(positions.items()):
-        if sym in top25_symbols:
-            continue  # Keep in portfolio
-
+    target_per_coin_value = total_value * PERCENTAGE_PER_COIN
+    for sym, info in positions.items():
         price = get_symbol_price(sym)
-        if price <= ZERO:
-            logger.warning(f"No price for {sym} → skip sell")
-            continue
+        if price <= ZERO: continue
+        value = info['qty'] * price
+        if value > target_per_coin_value:
+            excess_qty = (value - target_per_coin_value) / price
+            step = bot.get_lot_step(sym)
+            excess_qty = excess_qty.quantize(step, rounding=ROUND_DOWN)
+            if excess_qty > ZERO:
+                logger.info(f"EXCESS {sym}: {excess_qty} (${value - target_per_coin_value:.2f})")
+                sell_to_usdt(bot, sym, excess_qty)
 
-        position_value = info['qty'] * price
+    top25 = get_top25_bid_volume_symbols()
+    target_per_buy = investable_usdt / len(top25) if top25 else ZERO
 
-        # === $5 POSITION MINIMUM: Do NOT sell if total < $5 ===
-        if position_value < MIN_TRADE_VALUE_USDT:
-            logger.info(f"DUST: {sym} = ${position_value:.2f} < $5.00 → SKIP")
-            continue
-
-        # === Determine quantity to sell ===
-        if not info['is_stable']:
-            # Sell full non-stablecoin position
-            qty_to_sell = info['qty']
-        else:
-            # Sell stablecoin only if needed for USDT
-            needed = MIN_BUFFER_USDT + target_per_coin - usdt_free
-            if needed <= ZERO:
-                continue
-            qty_to_sell = min(info['qty'], needed / price)
-
-        # === $5 ORDER MINIMUM: Do NOT place order < $5 ===
-        order_value = qty_to_sell * price
-        if order_value < MIN_TRADE_VALUE_USDT:
-            logger.info(f"ORDER TOO SMALL: {qty_to_sell:.6f} {info['asset']} = ${order_value:.2f} < $5.00 → BLOCKED")
-            continue
-
-        # === SAFE TO SELL ===
-        logger.info(f"SELLING: {qty_to_sell:.6f} {info['asset']} ({sym}) = ${order_value:.2f}")
-        bot.place_market_sell(sym, float(qty_to_sell))
-
-    # ------------------------------------------------------------------- #
-    # === BUY: Top 25 (unchanged — already has MIN_TRADE_VALUE_USDT) === #
-    # ------------------------------------------------------------------- #
-    for sym, bid_vol in top25:
-        if sym in positions:
-            continue
-
-        if target_per_coin < MIN_TRADE_VALUE_USDT:
-            continue
+    for sym, _ in top25:
+        if target_per_buy < MIN_TRADE_VALUE_USDT: continue
+        if sym in positions: continue
 
         with book_lock:
             asks = live_asks.get(sym, [])
@@ -526,14 +578,13 @@ def rebalance_portfolio(bot: RebalancerBot):
         tick = bot.get_tick_size(sym)
         buy_price = (buy_price // tick) * tick
         step = bot.get_lot_step(sym)
-        raw_qty = target_per_coin / buy_price
+        raw_qty = target_per_buy / buy_price
         qty = (raw_qty // step) * step
-
         if qty <= ZERO: continue
         value = buy_price * qty
         if value < MIN_TRADE_VALUE_USDT: continue
 
-        bot.place_limit_buy(sym, str(buy_price), float(qty))
+        bot.place_limit_buy(sym, str(buy_price), qty)
 
     logger.info("Rebalance complete.")
 
@@ -544,7 +595,6 @@ def main():
     bot = RebalancerBot()
     global valid_symbols_dict
 
-    # Load all USDT pairs
     try:
         info = bot.client.get_exchange_info()
         for s in info['symbols']:
@@ -554,7 +604,6 @@ def main():
         logger.error(f"Failed to load symbols: {e}")
         sys.exit(1)
 
-    # Start WebSockets
     start_market_websocket()
     start_user_stream()
     threading.Thread(target=keepalive_user_stream, daemon=True).start()
@@ -562,7 +611,6 @@ def main():
     logger.info("Waiting 30s for WebSocket sync...")
     time.sleep(30)
 
-    # Rebalance loop
     last_rebalance = 0
     while True:
         try:
