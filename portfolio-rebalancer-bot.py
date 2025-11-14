@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-    BINANCE.US PORTFOLIO REBALANCER
-    • Sell excess >5% per position (limit → retry 2x → market)
-    • $8 buffer + 1/5 cash reserve | $5 min order | WhatsApp alerts
-    • FULLY FIXED: Decimal/float safety, lot/tick handling
+BINANCE.US PORTFOLIO REBALANCER
+• Sell excess >5% per position (limit → retry 2x → market)
+• $8 buffer + 1/5 cash reserve | $5 min order | WhatsApp alerts
+• FULLY FIXED: Decimal/float safety, lot/tick handling
 """
 
 import os
@@ -16,7 +16,7 @@ import websocket
 import requests
 from decimal import Decimal, ROUND_DOWN
 from datetime import datetime
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Set
 
 from binance.client import Client
 from binance.exceptions import BinanceAPIException
@@ -78,7 +78,7 @@ if not logger.handlers:
 # --------------------------------------------------------------------------- #
 # =============================== GLOBAL STATE ============================= #
 # --------------------------------------------------------------------------- #
-valid_symbols_dict: Dict[str, dict] = {}
+valid_symbols: Set[str] = set()
 live_prices: Dict[str, Decimal] = {}
 live_bids: Dict[str, List[Tuple[Decimal, Decimal]]] = {}
 live_asks: Dict[str, List[Tuple[Decimal, Decimal]]] = {}
@@ -276,7 +276,7 @@ def on_ws_close(ws, code, msg):
 # --------------------------------------------------------------------------- #
 def start_market_websocket():
     global ws_instances, ws_threads
-    symbols = [s.lower() for s in valid_symbols_dict.keys() if 'USDT' in s]
+    symbols = [s.lower() for s in valid_symbols if 'USDT' in s]
     ticker_streams = [f"{s}@ticker" for s in symbols]
     depth_streams = [f"{s}@depth{DEPTH_LEVELS}" for s in symbols]
     all_streams = ticker_streams + depth_streams
@@ -353,13 +353,14 @@ class RebalancerBot:
                 return Decimal(f['stepSize'])
         return Decimal('0.00000001')
 
-    def get_balance(self) -> Decimal:
+    def get_cash(self) -> Decimal:
         with self.api_lock:
             acct = self.client.get_account()
+        cash = ZERO
         for b in acct['balances']:
-            if b['asset'] == 'USDT':
-                return to_decimal(b['free'])
-        return ZERO
+            if is_stablecoin(b['asset']):
+                cash += to_decimal(b['free'])
+        return cash
 
     def get_total_account_value(self) -> Decimal:
         with self.api_lock:
@@ -369,7 +370,7 @@ class RebalancerBot:
             asset = b['asset']
             qty = to_decimal(b['free'])
             if qty <= ZERO: continue
-            if asset == 'USDT':
+            if is_stablecoin(asset):
                 total += qty
                 continue
             sym = f"{asset}USDT"
@@ -477,12 +478,8 @@ def rebalance_portfolio(bot: RebalancerBot):
     logger.info("Starting portfolio rebalance...")
 
     total_value = bot.get_total_account_value()
-    usdt_free = bot.get_balance()
-    logger.info(f"Total Value: ${total_value:.2f} | USDT Free: ${usdt_free:.2f}")
-
-    min_cash_reserve = max(usdt_free * MIN_USDT_FRACTION, MIN_BUFFER_USDT)
-    investable_usdt = max(usdt_free - min_cash_reserve, ZERO)
-    logger.info(f"Investable: ${investable_usdt:.2f} | Reserve: ${min_cash_reserve:.2f}")
+    cash_free = bot.get_cash()
+    logger.info(f"Total Value: ${total_value:.2f} | Cash Free: ${cash_free:.2f}")
 
     with bot.api_lock:
         acct = bot.client.get_account()
@@ -490,9 +487,9 @@ def rebalance_portfolio(bot: RebalancerBot):
     for b in acct['balances']:
         asset = b['asset']
         qty = to_decimal(b['free'])
-        if qty <= ZERO or asset == 'USDT': continue
+        if qty <= ZERO or is_stablecoin(asset): continue
         sym = f"{asset}USDT"
-        if sym not in valid_symbols_dict: continue
+        if sym not in valid_symbols: continue
         positions[sym] = {'asset': asset, 'qty': qty}
 
     target_per_coin_value = total_value * PERCENTAGE_PER_COIN
@@ -515,13 +512,13 @@ def rebalance_portfolio(bot: RebalancerBot):
 # --------------------------------------------------------------------------- #
 def main():
     bot = RebalancerBot()
-    global valid_symbols_dict
+    global valid_symbols
 
     try:
         info = bot.client.get_exchange_info()
         for s in info['symbols']:
             if s['quoteAsset'] == 'USDT' and s['status'] == 'TRADING':
-                valid_symbols_dict[s['symbol']] = {'volume': 1e6}
+                valid_symbols.add(s['symbol'])
     except Exception as e:
         logger.error(f"Failed to load symbols: {e}")
         sys.exit(1)
