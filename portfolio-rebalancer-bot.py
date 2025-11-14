@@ -1,11 +1,7 @@
 #!/usr/bin/env python3
 """
-    PORTFOLIO REBALANCER – TOP 100 BID VOLUME → BULLISH FILTER (6M)
+    BINANCE.US PORTFOLIO REBALANCER
     • Sell excess >5% per position (limit → retry 2x → market)
-    • Buy 5% of total USDT cash into each qualifying Top 100 coin
-    • Step 1: Rank by 5-level bid volume
-    • Step 2: Filter by +15% gain in last 6 months
-    • No BTC, ETH, BCH | >$100k volume | >5 depth bids
     • $8 buffer + 1/5 cash reserve | $5 min order | WhatsApp alerts
     • FULLY FIXED: Decimal/float safety, lot/tick handling
 """
@@ -21,8 +17,6 @@ import requests
 from decimal import Decimal, ROUND_DOWN
 from datetime import datetime
 from typing import Dict, List, Tuple
-from logging.handlers import TimedRotatingFileHandler
-import math
 
 from binance.client import Client
 from binance.exceptions import BinanceAPIException
@@ -45,23 +39,11 @@ if not API_KEY or not API_SECRET:
 REBALANCE_INTERVAL_SEC = 2 * 60 * 60  # 2 hours
 MIN_BUFFER_USDT = Decimal('8.0')
 MIN_TRADE_VALUE_USDT = Decimal('5.0')
-ENTRY_PCT_BELOW_ASK = Decimal('0.001')  # 0.1%
-TOP_N = 100                             # ← TOP 100 BID VOLUME
-MAX_POSITIONS = 20                      # ← Safety cap
 PERCENTAGE_PER_COIN = Decimal('0.05')   # 5% per coin
 MIN_USDT_FRACTION = Decimal('0.2')       # 1/5 in cash
 
 # ---- Filters ---------------------------------------------------------------
-MIN_24H_VOLUME_USDT = 100000
-MIN_PRICE = Decimal('1.00')
-MAX_PRICE = Decimal('1000')
-EXCLUDED_COINS = {'BTC', 'BCH', 'ETH'}
 STABLECOINS = {'USDT', 'USDC', 'BUSD', 'TUSD', 'DAI', 'FDUSD', 'EURI', 'EURC'}
-
-# ---- Bullish Filter ---------------------------------------------------------
-BULLISH_LOOKBACK_DAYS = 180
-MIN_6M_GAIN_PCT = Decimal('15')         # Only coins up 15%+ in 6 months
-KLINE_INTERVAL = Client.KLINE_INTERVAL_1DAY
 
 # ---- WebSocket -------------------------------------------------------------
 WS_BASE = "wss://stream.binance.us:9443/stream?streams="
@@ -251,11 +233,9 @@ def on_market_message(ws, message):
 
         if stream.endswith('@ticker'):
             price = to_decimal(payload.get('c', '0'))
-            volume = to_decimal(payload.get('v', '0')) * price
             if price > ZERO:
                 with price_lock:
                     live_prices[symbol] = price
-                valid_symbols_dict[symbol]['volume'] = float(volume)
 
         elif stream.endswith(f'@depth{DEPTH_LEVELS}'):
             bids = [(to_decimal(p), to_decimal(q)) for p, q in payload.get('bids', [])]
@@ -426,21 +406,6 @@ class RebalancerBot:
             logger.error(f"Market sell failed {symbol}: {e}")
             return None
 
-    def place_limit_buy(self, symbol: str, price: str, qty: Decimal):
-        try:
-            with self.api_lock:
-                order = self.client.order_limit_buy(
-                    symbol=symbol,
-                    quantity=str(qty),
-                    price=price
-                )
-            logger.info(f"LIMIT BUY: {symbol} @ {price} | Qty: {qty}")
-            send_whatsapp_alert(f"BUY {symbol} @ {price}")
-            return order
-        except Exception as e:
-            logger.error(f"Limit buy failed {symbol}: {e}")
-            return None
-
     def cancel_order(self, symbol: str, order_id: int):
         try:
             with self.api_lock:
@@ -458,81 +423,6 @@ class RebalancerBot:
             return order['status']
         except:
             return None
-
-# --------------------------------------------------------------------------- #
-# =========================== BULLISH HELPER =============================== #
-# --------------------------------------------------------------------------- #
-@retry_custom
-def get_6m_price_gain(bot: RebalancerBot, symbol: str) -> Decimal:
-    try:
-        with bot.api_lock:
-            klines = bot.client.get_historical_klines(
-                symbol, KLINE_INTERVAL, f"{BULLISH_LOOKBACK_DAYS} days ago UTC"
-            )
-        if len(klines) < 2:
-            return Decimal('-100')
-        open_price = Decimal(klines[0][1])
-        close_price = Decimal(klines[-1][4])
-        if open_price <= ZERO:
-            return Decimal('-100')
-        return ((close_price - open_price) / open_price) * 100
-    except Exception as e:
-        logger.debug(f"6M gain failed {symbol}: {e}")
-        return Decimal('-100')
-
-# --------------------------------------------------------------------------- #
-# =========================== RANKING LOGIC ================================ #
-# --------------------------------------------------------------------------- #
-def get_top_n_bid_then_bullish_symbols(bot: RebalancerBot) -> List[Tuple[str, float]]:
-    """
-    1. Get TOP_N by 5-level bid volume
-    2. Filter by 6-month gain >= MIN_6M_GAIN_PCT
-    3. Return ranked list
-    """
-    candidates = []
-    logger.info(f"Ranking top {TOP_N} by bid volume...")
-
-    for sym in valid_symbols_dict:
-        if not sym.endswith('USDT'): continue
-        base = sym.replace('USDT', '')
-        if base in EXCLUDED_COINS or is_stablecoin(base): continue
-
-        with book_lock:
-            bids = live_bids.get(sym, [])
-        if len(bids) < DEPTH_LEVELS:
-            continue
-
-        bid_usdt_vol = sum(float(p) * float(q) for p, q in bids[:DEPTH_LEVELS])
-        if bid_usdt_vol <= 0: continue
-
-        with price_lock:
-            price = live_prices.get(sym, ZERO)
-        if price <= ZERO or price < MIN_PRICE or price > MAX_PRICE:
-            continue
-        if valid_symbols_dict[sym]['volume'] < MIN_24H_VOLUME_USDT:
-            continue
-
-        candidates.append((sym, bid_usdt_vol))
-
-    candidates.sort(key=lambda x: x[1], reverse=True)
-    top_by_volume = candidates[:TOP_N]
-    logger.info(f"Top {len(top_by_volume)} by bid volume")
-
-    # Now filter by bullishness
-    bullish = []
-    logger.info(f"Applying 6M gain filter (>= {MIN_6M_GAIN_PCT}%)...")
-    for sym, vol in top_by_volume:
-        gain = get_6m_price_gain(bot, sym)
-        if gain >= MIN_6M_GAIN_PCT:
-            score = float(gain) * math.log(vol + 1)
-            bullish.append((sym, score))
-            logger.debug(f"{sym}: +{gain:.1f}% → kept")
-        else:
-            logger.debug(f"{sym}: +{gain:.1f}% → filtered out")
-
-    bullish.sort(key=lambda x: x[1], reverse=True)
-    logger.info(f"{len(bullish)} coins passed bullish filter")
-    return bullish
 
 # --------------------------------------------------------------------------- #
 # =========================== REBALANCING LOGIC ============================= #
@@ -617,58 +507,6 @@ def rebalance_portfolio(bot: RebalancerBot):
             if excess_qty > ZERO:
                 logger.info(f"EXCESS {sym}: {excess_qty} (${value - target_per_coin_value:.2f})")
                 sell_to_usdt(bot, sym, excess_qty)
-
-    # MAIN: Bid volume → Bullish filter
-    top_coins = get_top_n_bid_then_bullish_symbols(bot)
-    logger.info(f"Final buy list: {len(top_coins)} coins")
-
-    target_value = total_value * PERCENTAGE_PER_COIN
-    buys = []
-
-    for sym, _ in top_coins:
-        if sym in positions: continue
-        cur_qty = positions.get(sym, {}).get('qty', ZERO)
-        cur_value = cur_qty * get_symbol_price(sym)
-        needed = target_value - cur_value
-        if needed < MIN_TRADE_VALUE_USDT:
-            continue
-        buys.append((sym, needed))
-        if len(buys) >= MAX_POSITIONS:
-            break
-        if sum(b[1] for b in buys) >= investable_usdt:
-            break
-
-    logger.info(f"Executing {len(buys)} buys...")
-
-    for sym, needed_usdt in buys:
-        if needed_usdt > investable_usdt:
-            needed_usdt = investable_usdt
-        if needed_usdt < MIN_TRADE_VALUE_USDT:
-            continue
-
-        with book_lock:
-            asks = live_asks.get(sym, [])
-        if not asks:
-            logger.warning(f"No ask book for {sym}")
-            continue
-
-        ask_price = asks[0][0]
-        buy_price = (ask_price * (ONE - ENTRY_PCT_BELOW_ASK))
-        tick = bot.get_tick_size(sym)
-        buy_price = (buy_price // tick) * tick
-        step = bot.get_lot_step(sym)
-        raw_qty = needed_usdt / buy_price
-        qty = (raw_qty // step) * step
-        order_value = buy_price * qty
-
-        if order_value < MIN_TRADE_VALUE_USDT or investable_usdt < order_value:
-            logger.info(f"Skip {sym}: ${order_value:.2f} too small or no cash")
-            continue
-
-        gain = get_6m_price_gain(bot, sym)
-        bot.place_limit_buy(sym, str(buy_price), qty)
-        investable_usdt -= order_value
-        logger.info(f"BUY {sym}: {qty} @ {buy_price} (~${order_value:.2f}) | 6M: +{gain:.1f}%")
 
     logger.info("Rebalance complete.")
 
